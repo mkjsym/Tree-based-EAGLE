@@ -13910,9 +13910,9 @@ struct llm_build_eagle : public llm_graph_context {
 
         cur = inpL;
 
-        cur = build_norm(cur,
-                model.output_norm, NULL,
-                LLM_NORM_RMS, -1);
+        // cur = build_norm(cur,
+        //         model.output_norm, NULL,
+        //         LLM_NORM_RMS, -1);
 
         cb(cur, "result_norm", -1);
         res->t_embd = cur;
