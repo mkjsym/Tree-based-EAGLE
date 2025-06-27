@@ -32,7 +32,7 @@ static bool cb_get_hidden(struct ggml_tensor * tensor, bool ask, void * user_dat
         return is_result_norm;
     }
 
-    LOG_DBG("[%d, %d, %d, %d]\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    //LOG_DBG("[%d, %d, %d, %d]\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
     auto * cb_data = (struct callback_data *) user_data;
     auto n_bytes = ggml_nbytes(tensor);
     cb_data->data.resize(n_bytes / sizeof(float)); //float 타입으로 변경 -ym-
@@ -81,7 +81,7 @@ int main(int argc, char ** argv) {
     const int n_seq_dft = params.n_parallel;
 
     // probability threshold for splitting a draft branch (only for n_seq_dft > 1)
-    const float p_draft_split = params.speculative.p_split;
+    // const float p_draft_split = params.speculative.p_split; // 사용하지 않음 -ym-
 
     std::default_random_engine rng(params.sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device()() : params.sampling.seed);
     std::uniform_real_distribution<> u_dist;
@@ -174,7 +174,7 @@ int main(int argc, char ** argv) {
 
     auto * mem_tgt = llama_get_memory(ctx_tgt);
     auto * mem_dft = llama_get_memory(ctx_dft);
-    
+
     // Trick: if the output buffer is in host memory, we need to allocate a new buffer for the draft model
     if (ggml_backend_buffer_is_host(llama_get_model(ctx_dft)->output->buffer)) {
         void * data = malloc(ggml_nbytes(llama_get_model(ctx_tgt)->output));
@@ -209,7 +209,7 @@ int main(int argc, char ** argv) {
 
     llama_batch temp_batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
     int temp_n_past = 0;
-    for (int i = 0; i < inp.size() - 1; i++) {
+    for (size_t i = 0; i < inp.size() - 1; i++) {
         common_batch_add(temp_batch_tgt, inp[i], temp_n_past++, { 0 }, true);
     }
 
@@ -538,7 +538,7 @@ int main(int argc, char ** argv) {
                 std::vector temp4 = std::vector<float>(backup_data.begin(), backup_data.end() - 4096);
 
                 common_batch_clear(batch_dft);
-                for (int i = 0; i < recompute.size() - 1; i++) {
+                for (size_t i = 0; i < recompute.size() - 1; i++) {
                     common_batch_add  (batch_dft, recompute[i], recompute_point + i, { 0 }, false);
                 }
                 llama_decode_eagle(ctx_dft, batch_dft, temp4.data());
@@ -615,7 +615,7 @@ int main(int argc, char ** argv) {
 
                         llama_memory_seq_rm(mem_dft,    n_seq_cur, -1, -1);
                         llama_memory_seq_cp(mem_dft, s, n_seq_cur, -1, -1);
-                        
+
                         LOG_DBG("디버그: n_seq_cur = %d, cb_data.data.size() = %zu\n", n_seq_cur, backup_data.size());
                         temp.insert(temp.end(), cb_data.data.begin() + (4096 * s), cb_data.data.begin() + (4096 * (s + 1)));
 
@@ -686,7 +686,7 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            LOG_DBG("temp.size(): %d, batch_dft.n_tokens: %d\n", temp.size()/4096, batch_dft.n_tokens);
+            LOG_DBG("temp.size(): %zu, batch_dft.n_tokens: %d\n", temp.size()/(size_t)4096, batch_dft.n_tokens);
 
             // evaluate the drafted tokens on the draft model
             llama_decode_eagle(ctx_dft, batch_dft, temp.data());
