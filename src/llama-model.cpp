@@ -1697,7 +1697,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             // sanity checks
-            if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
+            if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT || info.layer == LLM_TENSOR_LAYER_INPUT_EAGLE) {
                 if (tn.bid != -1) {
                     GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
                 }
@@ -1718,6 +1718,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     break;
                 case LLM_TENSOR_LAYER_REPEATING:
                     buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+                    break;
+                case LLM_TENSOR_LAYER_INPUT_EAGLE:
+                    buft_list = pimpl->dev_output.buft_list;  // EAGLE input layer is the same as output layer
                     break;
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());

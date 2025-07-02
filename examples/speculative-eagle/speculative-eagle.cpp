@@ -41,10 +41,29 @@ static bool cb_get_hidden(struct ggml_tensor * tensor, bool ask, void * user_dat
     return true;
 }
 
+int64_t start_time;
+
+static bool cb_get_latency(struct ggml_tensor * tensor, bool ask, [[maybe_unused]] void * user_data) { //latency profiling callback function -ym-
+    if (ask) {
+        start_time = ggml_time_us();
+        return true;
+    }
+
+    int64_t end_time = ggml_time_us();
+    int64_t latency = end_time - start_time;
+    LOG_DBG("[[Latency for tensor]] '%s' (%s): %ld us ==> (%d)\n", tensor->name, ggml_op_name(tensor->op), latency, (int)ggml_backend_buffer_is_host(tensor->buffer));
+    ggml_tensor * src_tensor = tensor->src[0];
+    LOG_DBG("[[Latency for tensor]] [%d, %d, %d, %d]\n", (int)src_tensor->ne[0], (int)src_tensor->ne[1], (int)src_tensor->ne[2], (int)src_tensor->ne[3]);
+    LOG_DBG("[[Latency for tensor]] [%d, %d, %d, %d]\n", (int)tensor->ne[0], (int)tensor->ne[1], (int)tensor->ne[2], (int)tensor->ne[3]);
+
+
+    return true;
+}
+
 struct seq_draft { //각 드래프트 시퀀스(트리의 브랜치)의 상태를 저장하는 구조체 -ym-
-    bool active   = false;
-    bool drafting = false;
-    bool skip     = false;
+    bool active   = false; //verification 단계에서 시퀀스가 활성화되었는지 여부 -ym-
+    bool drafting = false; //drafting 단계에서 시퀀스가 활성화되었는지 여부 -ym-
+    bool skip     = false; //drafting 단계에서 이 시퀀스를 건너뛸지 여부 -ym-
 
     int i_batch_dft = 0; //드래프트 모델의 배치에서 이 시퀀스의 마지막 토큰 인덱스 -ym-
     std::vector<int> i_batch_tgt; //타겟 모델의 배치에서 이 시퀀스에 해당하는 토큰들의 인덱스 -ym-
@@ -115,6 +134,7 @@ int main(int argc, char ** argv) {
     }
 
     params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
+    //params.cb_eval = cb_get_latency;
     common_init_result llama_init_dft = common_init_from_params(params);
 
     model_dft = llama_init_dft.model.get();
