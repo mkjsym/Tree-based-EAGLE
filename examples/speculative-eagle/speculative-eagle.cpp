@@ -51,7 +51,7 @@ static bool cb_get_latency(struct ggml_tensor * tensor, bool ask, [[maybe_unused
 
     int64_t end_time = ggml_time_us();
     int64_t latency = end_time - start_time;
-    LOG_DBG("[[Latency for tensor]] '%s' (%s): %ld us ==> (%d)\n", tensor->name, ggml_op_name(tensor->op), latency, (int)ggml_backend_buffer_is_host(tensor->buffer));
+    LOG("[[Latency for tensor]] '%s' (%s): %ld us ==> (%d)\n", tensor->name, ggml_op_name(tensor->op), latency, (int)ggml_backend_buffer_is_host(tensor->buffer));
     ggml_tensor * src_tensor = tensor->src[0];
     LOG_DBG("[[Latency for tensor]] [%d, %d, %d, %d]\n", (int)src_tensor->ne[0], (int)src_tensor->ne[1], (int)src_tensor->ne[2], (int)src_tensor->ne[3]);
     LOG_DBG("[[Latency for tensor]] [%d, %d, %d, %d]\n", (int)tensor->ne[0], (int)tensor->ne[1], (int)tensor->ne[2], (int)tensor->ne[3]);
@@ -287,6 +287,8 @@ int main(int argc, char ** argv) {
 
     // [추가] 각 단계별 수락 길이를 저장하기 위한 벡터
     std::vector<int> acceptance_lengths;
+    std::vector<int> decoding_latencies;
+    std::vector<int> verification_latencies;
 
     for (int s = 0; s < n_seq_dft; ++s) {
         // allocate llama_sampler for each draft sequence
@@ -301,6 +303,8 @@ int main(int argc, char ** argv) {
     // sample from the last token of the prompt
     drafts[0].i_batch_tgt.resize(1);
     drafts[0].i_batch_tgt[0] = 0;
+
+    auto verification_start = ggml_time_us(); //verification 시작 시간 기록 -ym-
 
     while (true) {
         std::set<int> active_seqs = {};
@@ -513,13 +517,22 @@ int main(int argc, char ** argv) {
             }
         }
 
+        const auto verification_end = ggml_time_us(); //verification 종료 시간 기록 -ym-
+
+        int verification_latency = (verification_end - verification_start) / 1000; //ms 단위로 변환 -ym-
+        verification_latencies.push_back(verification_latency);
+        LOG_DBG("verification took %.3f seconds\n", (verification_end - verification_start) / 1e6f);
+
         // [추가] 현재 단계의 수락 길이를 저장합니다.
         // 루프가 끝났을 때 i_dft는 이번 단계에서 연속적으로 수락된 토큰의 개수와 같습니다.
         acceptance_lengths.push_back(i_dft);
 
         backup_data = temp2;
         std::vector temp3 = std::vector<float>(backup_data.end() - 4096, backup_data.end());
+
         int recompute_point = n_past_dft - i_dft;
+
+        const auto tree_decoding_start = ggml_time_us(); //tree decoding 시작 시간 기록 -ym-
 
         LOG_DBG("Current n_accept: %d, n_drafted: %d, n_predict: %d\n", n_accept, n_drafted, n_predict);
 
@@ -613,6 +626,8 @@ int main(int argc, char ** argv) {
                     continue;
                 }
 
+                const auto sampling_start = ggml_time_us(); //sampling 시작 시간 기록 -ym-
+
                 common_sampler_sample(drafts[s].smpl, ctx_dft, drafts[s].i_batch_dft, true);
 
                 const auto * cur_p = common_sampler_get_candidates(drafts[s].smpl);
@@ -626,11 +641,22 @@ int main(int argc, char ** argv) {
 
                 temp.insert(temp.end(), cb_data.data.begin() + (4096 * s), cb_data.data.begin() + (4096 * (s + 1)));
 
-                // attempt to split the branch if the probability is high enough
-                for (int f = 1; f < 2; ++f) {
+                const auto sampling_end = ggml_time_us(); //sampling 시작 시간 기록 -ym-
+                LOG("sampling took %f seconds\n", (sampling_end - sampling_start) / 1e6f);
+                
+                //EAGLE-1 like tree 구조
+                for (int f = 1; f < 3; ++f) {
                     LOG_DBG("cur_p->data[f].p = %lf\n", cur_p->data[f].p);
                     // if (n_seq_cur < n_seq_dft && cur_p->data[f].p > p_draft_split) {
-                    if (n_seq_cur < n_seq_dft) {
+                    if (n_seq_cur < n_seq_dft && s < 5) {
+                ///////////////////////////////////////////////
+
+                //기존 binary tree 구조
+                // for (int f = 1; f < 2; ++f) {
+                //     LOG_DBG("cur_p->data[f].p = %lf\n", cur_p->data[f].p);
+                //     // if (n_seq_cur < n_seq_dft && cur_p->data[f].p > p_draft_split) {
+                //     if (n_seq_cur < n_seq_dft) {
+                //////////////////////////////////////////////
                         LOG_DBG("splitting seq %3d into %3d\n", s, n_seq_cur);
 
                         llama_memory_seq_rm(mem_dft,    n_seq_cur, -1, -1);
@@ -709,7 +735,10 @@ int main(int argc, char ** argv) {
             LOG_DBG("temp.size(): %zu, batch_dft.n_tokens: %d\n", temp.size()/(size_t)4096, batch_dft.n_tokens);
 
             // evaluate the drafted tokens on the draft model
+            const auto dft_model_decode_start = ggml_time_us(); //dft_model decode 시작 시간 기록 -ym-
             llama_decode_eagle(ctx_dft, batch_dft, temp.data());
+            const auto dft_model_decode_end = ggml_time_us(); //dft_model decode 종료 시간 기록 -ym-
+            LOG_DBG("draft model decoding took %.3f seconds\n", (dft_model_decode_end - dft_model_decode_start) / 1e6f);
             ++n_past_cur;
             ++n_drafted;
 
@@ -717,6 +746,14 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+
+        const auto tree_decoding_end = ggml_time_us(); //tree decoding 종료 시간 기록 -ym-
+        int tree_decoding_latency = (tree_decoding_end - tree_decoding_start) / 1000; //ms 단위로 변환 -ym-
+        decoding_latencies.push_back(tree_decoding_latency);
+
+        LOG_DBG("tree decoding took %.3f seconds\n", (tree_decoding_end - tree_decoding_start) / 1e6f);
+
+        verification_start = ggml_time_us(); //verification 시작 시간 기록 -ym-
 
         // evaluate the target model on the drafted tokens
         {
@@ -726,7 +763,10 @@ int main(int argc, char ** argv) {
             }
 
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
+            const auto t_dec_start = ggml_time_us(); //target model decode 시작 시간 기록 -ym-
             llama_decode(ctx_tgt, batch_tgt);
+            const auto t_dec_end = ggml_time_us(); //target model decode 종료 시간 기록 -ym-
+            LOG_DBG("target model decoding took %.3f seconds\n", (t_dec_end - t_dec_start) / 1e6f);
             backup_data = cb_data.data;
             ++n_past_tgt;
         }
@@ -768,6 +808,11 @@ int main(int argc, char ** argv) {
         LOG_INF("  Max length: %d\n", max_len);
         LOG_INF("  Avg length: %.3f\n", avg_len);
     }
+
+    const double avg_decoding_latency = std::accumulate(decoding_latencies.begin(), decoding_latencies.end(), 0.0) / decoding_latencies.size();
+    const double avg_verification_latency = std::accumulate(verification_latencies.begin(), verification_latencies.end(), 0.0) / verification_latencies.size();
+    LOG_INF("avg decoding latency: %.3f ms\n", avg_decoding_latency);
+    LOG_INF("avg verification latency: %.3f ms\n", avg_verification_latency);
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
