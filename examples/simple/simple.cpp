@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <numeric>
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -151,13 +152,21 @@ int main(int argc, char ** argv) {
     int n_decode = 0;
     llama_token new_token_id;
 
+    std::vector<float> decode_latencies;
+    std::vector<float> sampling_latencies;
+
     for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
+        const auto t_eval_start = ggml_time_us();
         if (llama_decode(ctx, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
+        const auto t_eval_end = ggml_time_us();
+        decode_latencies.push_back((t_eval_end - t_eval_start) / 1000.0f); // ms
+        //fprintf(stderr, "%s: eval took %.2f ms\n", __func__, (t_eval_end - t_eval_start) / 1000.0f);
 
+        const auto sampling_start = ggml_time_us();
         n_pos += batch.n_tokens;
 
         // sample the next token
@@ -184,9 +193,17 @@ int main(int argc, char ** argv) {
 
             n_decode += 1;
         }
+
+        const auto sampling_end = ggml_time_us();
+        sampling_latencies.push_back((sampling_end - sampling_start) / 1000.0f); // ms
+        //fprintf(stderr, "%s: sampling took %.2f ms\n", __func__, (sampling_end - sampling_start) / 1000.0f);
+
     }
 
-    printf("\n");
+    fprintf(stderr, "\n\n");
+
+    fprintf(stderr, "avg decoding latency: %.3f ms\n", std::accumulate(decode_latencies.begin(), decode_latencies.end(), 0.0) / decode_latencies.size());
+    fprintf(stderr, "avg sampling latency: %.3f ms\n", std::accumulate(sampling_latencies.begin(), sampling_latencies.end(), 0.0) / sampling_latencies.size());
 
     const auto t_main_end = ggml_time_us();
 

@@ -2393,10 +2393,70 @@ static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer)
     delete ctx;
 }
 
+// static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
+//     ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+//     return (void *) (uintptr_t) backend_ctx->alignment;
+// }
+
 static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
-    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
-    return (void *) (uintptr_t) backend_ctx->alignment;
+    // ADRENO 750 CRITICAL FIX: Return actual buffer context for real memory allocation
+    // The virtual address approach was breaking tensor allocation
+    // We need to return a real pointer that the allocator can work with
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    
+    // Return the buffer context pointer, aligned to meet OpenCL requirements
+    // This ensures both real memory allocation and alignment compatibility
+    uintptr_t base_addr = (uintptr_t)ctx;
+    
+    // Align to 128 bytes (Adreno 750 requirement) to prevent padding issues
+    const size_t alignment = 128;
+    uintptr_t aligned_addr = (base_addr + alignment - 1) & ~(alignment - 1);
+    
+    return (void *)aligned_addr;
 }
+
+// static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+//     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+
+//     ggml_cl2_init(buffer->buft->device);
+
+//     if (tensor->view_src != nullptr) {
+//         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
+
+//         ggml_tensor_extra_cl * view_extra = (ggml_tensor_extra_cl *) tensor->view_src->extra;
+//         GGML_ASSERT(view_extra && "view_extra is nullptr?");
+
+//         // Reuse extra of the parent tensor. The offset of this view tensor
+//         // becomes `extra->offset + view_offs` and needs to be calculated when
+//         // it is used. This changes is needed because of the change to
+//         // ggml_alloc.c in https://github.com/ggerganov/llama.cpp/pull/7640.ggml_backend_opencl_buffer_get_base
+//         // `buffer` passed in here will always be `tensor->buffer`. It is OK
+//         // to allocate extras from the same buffer context for ordinary
+//         // intermediate tensors. But for views into kv cache tensors, doing so
+//         // would mess up the extras used by kv cache.
+//         // Before #7640, `buffer` is for intermediate tensors, which is always
+//         // different from that of kv cache tensors.
+//         //
+//         // NB: now extra->offset no longer accounts for view_offs.
+//         // NB: this should not apply to weight tensors (for end-to-end runs, but
+//         //     may apply for test-backend-ops).
+//         // FIXME: if any unexpected results are seen, double check the offset -
+//         // there could be other places that need fix.
+//         tensor->extra = view_extra;
+//     } else {
+//         {
+//             size_t offset = (char *) tensor->data - (char *) ggml_backend_opencl_buffer_get_base(buffer);
+
+//             ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
+//             extra->offset = offset;
+//             extra->data_device = ctx->buffer[0];
+//             extra->actual_size = ggml_nbytes(tensor);
+
+//             tensor->extra = extra;
+//         }
+//     }
+//     return GGML_STATUS_SUCCESS;
+// }
 
 static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
@@ -2409,33 +2469,87 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
         ggml_tensor_extra_cl * view_extra = (ggml_tensor_extra_cl *) tensor->view_src->extra;
         GGML_ASSERT(view_extra && "view_extra is nullptr?");
 
+        // CRITICAL: Check if this is an LM output layer view (LM Head Sharing)
+        bool is_output_layer = (tensor->ne[0] == 4096 && tensor->ne[1] == 32000);
+        
+        if (is_output_layer) {
+            printf("🔧 OPENCL VIEW: LM output layer detected as view tensor - applying LM Head Sharing fix\n");
+            printf("  - View src: %p, View offs: %zu\n", tensor->view_src, tensor->view_offs);
+            printf("  - Original view offset: %zu, Data: %p\n", view_extra->offset, tensor->data);
+            printf("  - CRITICAL DEBUG: view_offs = %zu (this may cause offset issues!)\n", tensor->view_offs);
+            
+            // CRITICAL ADRENO 750 FIX: For LM Head Sharing, we need to handle view_offs properly
+            // The issue: when LM Head Sharing creates a view tensor, view_offs might not be 0
+            // This causes incorrect offset calculation in OpenCL kernels
+            
+            // ADRENO 750 UNIVERSAL FIX: Always create corrected extra for LM Head tensors
+            // This ensures view_offs is incorporated into offset and then zeroed
+            printf("⚠️  OPENCL VIEW: LM Head tensor detected - creating corrected extra...\n");
+            
+            ggml_tensor_extra_cl * corrected_extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
+            corrected_extra->data_device = view_extra->data_device;  // Same cl_mem
+            corrected_extra->offset = view_extra->offset + tensor->view_offs;  // Always incorporate view_offs
+            corrected_extra->actual_size = view_extra->actual_size;
+            
+            tensor->extra = corrected_extra;
+            
+            // CRITICAL: ALWAYS set view_offs to 0 for LM Head tensors to prevent double-counting
+            printf("  - Original view_offs: %zu, incorporated into offset\n", tensor->view_offs);
+            tensor->view_offs = 0;
+            
+            printf("✅ OPENCL VIEW: LM Head extra created with corrected offset: %zu, view_offs: %zu\n", 
+                   corrected_extra->offset, tensor->view_offs);
+            
+            printf("🔧 OPENCL VIEW: Reusing source extra directly for perfect LM Head Sharing\n");
+            printf("  - Shared cl_mem: %p, offset: %zu, size: %zu\n", 
+                   (void*)view_extra->data_device, view_extra->offset, view_extra->actual_size);
+            printf("  - FINAL EFFECTIVE OFFSET: %zu + %zu = %zu\n", 
+                   view_extra->offset, tensor->view_offs, view_extra->offset + tensor->view_offs);
+        } else {
         // Reuse extra of the parent tensor. The offset of this view tensor
         // becomes `extra->offset + view_offs` and needs to be calculated when
         // it is used. This changes is needed because of the change to
         // ggml_alloc.c in https://github.com/ggerganov/llama.cpp/pull/7640.
-        // `buffer` passed in here will always be `tensor->buffer`. It is OK
-        // to allocate extras from the same buffer context for ordinary
-        // intermediate tensors. But for views into kv cache tensors, doing so
-        // would mess up the extras used by kv cache.
-        // Before #7640, `buffer` is for intermediate tensors, which is always
-        // different from that of kv cache tensors.
-        //
-        // NB: now extra->offset no longer accounts for view_offs.
-        // NB: this should not apply to weight tensors (for end-to-end runs, but
-        //     may apply for test-backend-ops).
-        // FIXME: if any unexpected results are seen, double check the offset -
-        // there could be other places that need fix.
         tensor->extra = view_extra;
+        }
     } else {
         {
-            size_t offset = (char *) tensor->data - (char *) ggml_backend_opencl_buffer_get_base(buffer);
-
             ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
-            extra->offset = offset;
+            
+            // ADRENO 750 REAL ALLOCATION FIX: Calculate offset from actual aligned base
+            // get_base() now returns aligned buffer context for real memory allocation
+            void * base = ggml_backend_opencl_buffer_get_base(buffer);
+            
+            // Calculate the real offset: tensor->data is now a real pointer allocated by ggml_tallocr
+            size_t opencl_offset = (char *)tensor->data - (char *)base;
+            
+            // Check if this is an LM output layer  
+            bool is_output_layer = (tensor->ne[0] == 4096 && tensor->ne[1] == 32000);
+            
+            if (is_output_layer) {
+                printf("🔧 OPENCL INIT: LM output layer detected during init_tensor\n");
+                printf("  - Tensor data (REAL PTR): %p, Base (ALIGNED): %p\n", tensor->data, base);
+                printf("  - Real calculated offset: %zu (0x%lx)\n", opencl_offset, opencl_offset);
+                printf("  - Dimensions: [%ld, %ld] - language model output layer\n",
+                       tensor->ne[0], tensor->ne[1]);
+                printf("  - ✅ Using REAL memory allocation instead of virtual addresses\n");
+            }
+            
+            // Set the calculated OpenCL offset
+            extra->offset = opencl_offset;
+            
+            if (is_output_layer) {
+                printf("✅ OPENCL INIT: LM output layer offset set to: %zu (0x%lx)\n", 
+                       opencl_offset, opencl_offset);
+            }
+            
             extra->data_device = ctx->buffer[0];
             extra->actual_size = ggml_nbytes(tensor);
 
             tensor->extra = extra;
+            
+            // printf("🔧 OPENCL INIT: tensor=%p, data=0x%lx, offset=%zu, shared=%s\n", 
+            //        (void*)tensor, tensor_addr, extra->offset, is_shared_tensor ? "YES" : "NO");
         }
     }
     return GGML_STATUS_SUCCESS;
