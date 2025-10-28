@@ -347,6 +347,8 @@ public:
     virtual ggml_tensor * get_embd()        = 0;
     virtual ggml_tensor * get_embd_pooled() = 0;
 
+    // virtual ggml_tensor * get_topk() = 0;
+
     virtual void set_hidden_states(ggml_tensor * hidden_states) = 0;
     virtual ggml_tensor * get_hidden_states() = 0;
 
@@ -364,6 +366,8 @@ public:
     ggml_tensor * get_logits()      override { return t_logits; }
     ggml_tensor * get_embd()        override { return t_embd; }
     ggml_tensor * get_embd_pooled() override { return t_embd_pooled; }
+
+    // ggml_tensor * get_topk()      { return t_topk; }
 
     void set_hidden_states(ggml_tensor * hidden_states) override {
         t_hidden_states = hidden_states;
@@ -388,8 +392,9 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
-
     ggml_tensor * t_hidden_states = nullptr;
+
+    ggml_tensor * t_topk        = nullptr; // sorted logits, used by EAGLE
 
     std::vector<llm_graph_input_ptr> inputs;
 };

@@ -533,6 +533,14 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+// float * llama_context::get_topk() {
+//     if (topk_logits == nullptr) {
+//         throw std::runtime_error("no topk logits");
+//     }
+
+//     return topk_logits;
+// }
+
 float * llama_context::get_embeddings() {
     return embd;
 }
@@ -1104,6 +1112,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+
+        //Add topk tensor get
+        //auto * t_topk = res->get_topk();
+
+        // if (t_topk && n_outputs > 0) {
+        //     ggml_backend_t backend_topk = ggml_backend_sched_get_tensor_backend(sched.get(), t_topk);
+        //     GGML_ASSERT(backend_topk != nullptr);
+
+        //     // extract topk logits
+        //     GGML_ASSERT(topk_logits != nullptr);
+        //     float * topk_logits_out = topk_logits + n_outputs_prev*n_vocab;
+
+        //     if (n_outputs) {
+        //         GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+        //         GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) topk_size);
+        //         ggml_backend_tensor_get_async(backend_topk, t_topk, topk_logits_out, 0, n_outputs*n_vocab*sizeof(float));
+        //     }
+        // }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -2704,6 +2730,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 
     return ctx->get_logits_ith(i);
 }
+
+// float * llama_get_topk(llama_context * ctx) {
+//     ctx->synchronize();
+
+//     return ctx->get_topk();
+// }
 
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();

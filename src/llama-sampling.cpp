@@ -204,12 +204,12 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p) {
     GGML_ASSERT(cur_p->size > 0);
 
     // Sort the logits in descending order
-    if (!cur_p->sorted) {
-        std::sort(cur_p->data, cur_p->data + cur_p->size, [](const llama_token_data & a, const llama_token_data & b) {
-            return a.logit > b.logit;
-        });
-        cur_p->sorted = true;
-    }
+    // if (!cur_p->sorted) {
+    //     std::sort(cur_p->data, cur_p->data + cur_p->size, [](const llama_token_data & a, const llama_token_data & b) {
+    //         return a.logit > b.logit;
+    //     });
+    //     cur_p->sorted = true;
+    // }
 
     float max_l = cur_p->data[0].logit;
     float cum_sum = 0.0f;

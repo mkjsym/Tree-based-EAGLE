@@ -321,7 +321,6 @@ struct ggml_backend_opencl_context {
     cl_program program_upscale;
     cl_program program_concat;
     cl_program program_tsembd;
-    cl_program program_mul_mv_id_q4_0_f32_8x_flat;
 
     cl_kernel kernel_add, kernel_add_row;
     cl_kernel kernel_mul, kernel_mul_row;
@@ -367,7 +366,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_concat_f32_contiguous;
     cl_kernel kernel_concat_f32_non_contiguous;
     cl_kernel kernel_timestep_embedding;
-    cl_kernel kernel_mul_mv_id_q4_0_f32_8x_flat;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Transpose kernels
@@ -1114,7 +1112,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
-    // repeat
+        // repeat
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -1256,22 +1254,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             backend_ctx->program_tsembd = nullptr;
             backend_ctx->kernel_timestep_embedding = nullptr;
         }
-    }
-
-    // mul_mv_id_q4_0_f32_8x_flat
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "mul_mv_id_q4_0_f32_8x_flat.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("mul_mv_id_q4_0_f32_8x_flat.cl");
-#endif
-        backend_ctx->program_mul_mv_id_q4_0_f32_8x_flat =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat = clCreateKernel(backend_ctx->program_mul_mv_id_q4_0_f32_8x_flat, "kernel_mul_mv_id_q4_0_f32_8x_flat", &err), err));
-        GGML_LOG_CONT(".");
     }
 
     // Adreno kernels
@@ -1843,6 +1825,21 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
 static void ggml_cl2_free(void) {
 #ifdef GGML_OPENCL_PROFILING
+    // 중복 호출 방지 - 이 부분이 핵심!
+    static bool already_freed = false;
+    if (already_freed) {
+        return;
+    }
+    already_freed = true;
+    
+    // 나머지 코드는 그대로...
+    for (auto& dev : g_ggml_backend_opencl_devices) {
+        auto* ctx = ggml_cl2_init(&dev);
+        if (ctx && ctx->queue) {
+            clFinish(ctx->queue);
+        }
+    }
+    
     FILE * fperf = fopen("cl_profiling.csv", "w");
     if (!fperf) {
         GGML_LOG_ERROR("Failed to open cl_profiling.csv\n");
@@ -2196,13 +2193,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             }
             return false;
-        case GGML_OP_MUL_MAT_ID:
-            if (op->src[0]->type == GGML_TYPE_Q4_0) {
-                if (op->src[1]->type == GGML_TYPE_F32) {
-                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
-                }
-            }
-            return false;
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
@@ -2393,70 +2383,10 @@ static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer)
     delete ctx;
 }
 
-// static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
-//     ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
-//     return (void *) (uintptr_t) backend_ctx->alignment;
-// }
-
 static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
-    // ADRENO 750 CRITICAL FIX: Return actual buffer context for real memory allocation
-    // The virtual address approach was breaking tensor allocation
-    // We need to return a real pointer that the allocator can work with
-    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-    
-    // Return the buffer context pointer, aligned to meet OpenCL requirements
-    // This ensures both real memory allocation and alignment compatibility
-    uintptr_t base_addr = (uintptr_t)ctx;
-    
-    // Align to 128 bytes (Adreno 750 requirement) to prevent padding issues
-    const size_t alignment = 128;
-    uintptr_t aligned_addr = (base_addr + alignment - 1) & ~(alignment - 1);
-    
-    return (void *)aligned_addr;
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+    return (void *) (uintptr_t) backend_ctx->alignment;
 }
-
-// static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
-//     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-
-//     ggml_cl2_init(buffer->buft->device);
-
-//     if (tensor->view_src != nullptr) {
-//         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
-
-//         ggml_tensor_extra_cl * view_extra = (ggml_tensor_extra_cl *) tensor->view_src->extra;
-//         GGML_ASSERT(view_extra && "view_extra is nullptr?");
-
-//         // Reuse extra of the parent tensor. The offset of this view tensor
-//         // becomes `extra->offset + view_offs` and needs to be calculated when
-//         // it is used. This changes is needed because of the change to
-//         // ggml_alloc.c in https://github.com/ggerganov/llama.cpp/pull/7640.ggml_backend_opencl_buffer_get_base
-//         // `buffer` passed in here will always be `tensor->buffer`. It is OK
-//         // to allocate extras from the same buffer context for ordinary
-//         // intermediate tensors. But for views into kv cache tensors, doing so
-//         // would mess up the extras used by kv cache.
-//         // Before #7640, `buffer` is for intermediate tensors, which is always
-//         // different from that of kv cache tensors.
-//         //
-//         // NB: now extra->offset no longer accounts for view_offs.
-//         // NB: this should not apply to weight tensors (for end-to-end runs, but
-//         //     may apply for test-backend-ops).
-//         // FIXME: if any unexpected results are seen, double check the offset -
-//         // there could be other places that need fix.
-//         tensor->extra = view_extra;
-//     } else {
-//         {
-//             size_t offset = (char *) tensor->data - (char *) ggml_backend_opencl_buffer_get_base(buffer);
-
-//             ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
-//             extra->offset = offset;
-//             extra->data_device = ctx->buffer[0];
-//             extra->actual_size = ggml_nbytes(tensor);
-
-//             tensor->extra = extra;
-//         }
-//     }
-//     return GGML_STATUS_SUCCESS;
-// }
 
 static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
@@ -2469,87 +2399,33 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
         ggml_tensor_extra_cl * view_extra = (ggml_tensor_extra_cl *) tensor->view_src->extra;
         GGML_ASSERT(view_extra && "view_extra is nullptr?");
 
-        // CRITICAL: Check if this is an LM output layer view (LM Head Sharing)
-        bool is_output_layer = (tensor->ne[0] == 4096 && tensor->ne[1] == 32000);
-        
-        if (is_output_layer) {
-            printf("🔧 OPENCL VIEW: LM output layer detected as view tensor - applying LM Head Sharing fix\n");
-            printf("  - View src: %p, View offs: %zu\n", tensor->view_src, tensor->view_offs);
-            printf("  - Original view offset: %zu, Data: %p\n", view_extra->offset, tensor->data);
-            printf("  - CRITICAL DEBUG: view_offs = %zu (this may cause offset issues!)\n", tensor->view_offs);
-            
-            // CRITICAL ADRENO 750 FIX: For LM Head Sharing, we need to handle view_offs properly
-            // The issue: when LM Head Sharing creates a view tensor, view_offs might not be 0
-            // This causes incorrect offset calculation in OpenCL kernels
-            
-            // ADRENO 750 UNIVERSAL FIX: Always create corrected extra for LM Head tensors
-            // This ensures view_offs is incorporated into offset and then zeroed
-            printf("⚠️  OPENCL VIEW: LM Head tensor detected - creating corrected extra...\n");
-            
-            ggml_tensor_extra_cl * corrected_extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
-            corrected_extra->data_device = view_extra->data_device;  // Same cl_mem
-            corrected_extra->offset = view_extra->offset + tensor->view_offs;  // Always incorporate view_offs
-            corrected_extra->actual_size = view_extra->actual_size;
-            
-            tensor->extra = corrected_extra;
-            
-            // CRITICAL: ALWAYS set view_offs to 0 for LM Head tensors to prevent double-counting
-            printf("  - Original view_offs: %zu, incorporated into offset\n", tensor->view_offs);
-            tensor->view_offs = 0;
-            
-            printf("✅ OPENCL VIEW: LM Head extra created with corrected offset: %zu, view_offs: %zu\n", 
-                   corrected_extra->offset, tensor->view_offs);
-            
-            printf("🔧 OPENCL VIEW: Reusing source extra directly for perfect LM Head Sharing\n");
-            printf("  - Shared cl_mem: %p, offset: %zu, size: %zu\n", 
-                   (void*)view_extra->data_device, view_extra->offset, view_extra->actual_size);
-            printf("  - FINAL EFFECTIVE OFFSET: %zu + %zu = %zu\n", 
-                   view_extra->offset, tensor->view_offs, view_extra->offset + tensor->view_offs);
-        } else {
         // Reuse extra of the parent tensor. The offset of this view tensor
         // becomes `extra->offset + view_offs` and needs to be calculated when
         // it is used. This changes is needed because of the change to
         // ggml_alloc.c in https://github.com/ggerganov/llama.cpp/pull/7640.
+        // `buffer` passed in here will always be `tensor->buffer`. It is OK
+        // to allocate extras from the same buffer context for ordinary
+        // intermediate tensors. But for views into kv cache tensors, doing so
+        // would mess up the extras used by kv cache.
+        // Before #7640, `buffer` is for intermediate tensors, which is always
+        // different from that of kv cache tensors.
+        //
+        // NB: now extra->offset no longer accounts for view_offs.
+        // NB: this should not apply to weight tensors (for end-to-end runs, but
+        //     may apply for test-backend-ops).
+        // FIXME: if any unexpected results are seen, double check the offset -
+        // there could be other places that need fix.
         tensor->extra = view_extra;
-        }
     } else {
         {
+            size_t offset = (char *) tensor->data - (char *) ggml_backend_opencl_buffer_get_base(buffer);
+
             ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
-            
-            // ADRENO 750 REAL ALLOCATION FIX: Calculate offset from actual aligned base
-            // get_base() now returns aligned buffer context for real memory allocation
-            void * base = ggml_backend_opencl_buffer_get_base(buffer);
-            
-            // Calculate the real offset: tensor->data is now a real pointer allocated by ggml_tallocr
-            size_t opencl_offset = (char *)tensor->data - (char *)base;
-            
-            // Check if this is an LM output layer  
-            bool is_output_layer = (tensor->ne[0] == 4096 && tensor->ne[1] == 32000);
-            
-            if (is_output_layer) {
-                printf("🔧 OPENCL INIT: LM output layer detected during init_tensor\n");
-                printf("  - Tensor data (REAL PTR): %p, Base (ALIGNED): %p\n", tensor->data, base);
-                printf("  - Real calculated offset: %zu (0x%lx)\n", opencl_offset, opencl_offset);
-                printf("  - Dimensions: [%ld, %ld] - language model output layer\n",
-                       tensor->ne[0], tensor->ne[1]);
-                printf("  - ✅ Using REAL memory allocation instead of virtual addresses\n");
-            }
-            
-            // Set the calculated OpenCL offset
-            extra->offset = opencl_offset;
-            
-            if (is_output_layer) {
-                printf("✅ OPENCL INIT: LM output layer offset set to: %zu (0x%lx)\n", 
-                       opencl_offset, opencl_offset);
-            }
-            
+            extra->offset = offset;
             extra->data_device = ctx->buffer[0];
             extra->actual_size = ggml_nbytes(tensor);
 
             tensor->extra = extra;
-            
-            // printf("🔧 OPENCL INIT: tensor=%p, data=0x%lx, offset=%zu, shared=%s\n", 
-            //        (void*)tensor, tensor_addr, extra->offset, is_shared_tensor ? "YES" : "NO");
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -4517,7 +4393,8 @@ static void ggml_cl_tanh(ggml_backend_t backend, const ggml_tensor * src0, const
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size_ptr, 0, NULL, &evt));
 
     g_profiling_info.emplace_back();
-    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, local_work_size_ptr ? local_work_size : (size_t[3]){0,0,0}, dst);
+    size_t lws_zeros_tanh[3] = {0,0,0};
+    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, local_work_size_ptr ? local_work_size :  lws_zeros_tanh, dst);
 #else
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size_ptr, 0, NULL, NULL));
 #endif
@@ -4586,7 +4463,8 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, NULL, 0, NULL, &evt));
 
     g_profiling_info.emplace_back();
-    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, (size_t[3]){0,0,0}, dst);
+    size_t lws_zeros_repeat[3] = {0,0,0};
+    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, lws_zeros_repeat, dst);
 #else
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, NULL, 0, NULL, NULL));
 #endif
@@ -4652,7 +4530,8 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size_ptr, 0, NULL, &evt));
 
     g_profiling_info.emplace_back();
-    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, local_work_size_ptr ? local_work_size : (size_t[3]){0,0,0}, dst);
+    size_t lws_zeros_pad[3] = {0,0,0};
+    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, local_work_size_ptr ? local_work_size : lws_zeros_pad, dst);
 #else
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size_ptr, 0, NULL, NULL));
 #endif
@@ -5144,14 +5023,21 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             int width_B = K/4;
             int padded_height_B = (N + padding)/4;
 
+            int height_B2 = (N + 3)/4;
+            int width_B2 = K;
+
+            int padded_height_B2 = (N + padding + 3)/4;
+
             kernel = backend_ctx->kernel_transpose_32_16;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &B_d_input_image));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &B_image1d));
-            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &height_B));
-            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),    &width_B));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &height_B2));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),    &width_B2));
             CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),    &padded_height_B));
 
-            size_t local_size_t[2] = { 1, 16 };
+            // size_t local_size_t[2] = { 1, 16 };
+            size_t local_size_t[2] = { 16, 1 };
+
             //WGS tuning
             if (ne0 == 4096 && ne1 == 128 && ne10 == 4096) {
                 local_size_t[0]=4;
@@ -5167,9 +5053,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 local_size_t[1]=8;
             }
 
+            // size_t global_size_t[2] = {
+            //     static_cast<size_t>(width_B),
+            //     static_cast<size_t>(padded_height_B)
+            // };
+
             size_t global_size_t[2] = {
-                static_cast<size_t>(width_B),
-                static_cast<size_t>(padded_height_B)
+                static_cast<size_t>(width_B2),
+                static_cast<size_t>(padded_height_B2)
             };
 
             #ifdef GGML_OPENCL_PROFILING
@@ -5272,6 +5163,38 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         local_work_size[0]  = (size_t)(1); //4x32 for FP32
         local_work_size[1]  = (size_t)(128);
         local_work_size[2]  = (size_t)(1);
+
+        size_t TILE_N = 8;
+        size_t TILE_M = 4;
+        size_t TILE_K = 4;
+        size_t WI_N = 1;
+        size_t WI_M = 128;
+        size_t WI_K = 1;
+        if(N <= 8){
+            WI_M = 4;
+            WI_K = 32;
+        }
+        if(N <= 128){
+            WI_M = 32;
+            WI_K = 4;
+        }
+        else if(N <= 512){
+            WI_M = 64;
+            WI_K = 2;
+        }
+
+        size_t DIM_N = 0;
+        size_t DIM_M = 1;
+        size_t DIM_K = 2;
+        size_t WG_N = (N+TILE_N-1) / TILE_N / WI_N;
+        size_t WG_M = M / TILE_M / WI_M;
+
+        global_work_size[0] = WG_N * WI_N;
+        global_work_size[1] = WG_M * WI_M;
+        global_work_size[2] = WI_K;
+        local_work_size[0]  = WI_N;
+        local_work_size[1]  = WI_M;
+        local_work_size[2]  = WI_K;
 
         //WGS tuning
         if (ne0 == 4096 && ne1 == 128 && ne10 == 4096) {
@@ -5673,136 +5596,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
-}
-
-static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
-
-    const ggml_tensor * src2 = dst->src[2];
-    GGML_ASSERT(src2);
-    GGML_ASSERT(src2->extra);
-
-    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
-    cl_command_queue queue = backend_ctx->queue;
-
-    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
-    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
-    cl_ulong offset2 = extra2->offset + src2->view_offs;
-    cl_ulong offsetd = extrad->offset + dst->view_offs;
-
-#ifdef GGML_OPENCL_SOA_Q
-    ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)src0->extra;
-#endif
-
-    const int ne00 = src0->ne[0];
-    const int ne01 = src0->ne[1];
-    const int ne02 = src0->ne[2];
-    const int ne03 = src0->ne[3];
-
-    const cl_ulong nb00 = src0->nb[0];
-    const cl_ulong nb02 = src0->nb[2];
-
-    const int ne10 = src1->ne[0];
-    const int ne11 = src1->ne[1];
-    const int ne12 = src1->ne[2];
-    const int ne13 = src1->ne[3];
-
-    const cl_ulong nb11 = src1->nb[1];
-    const cl_ulong nb12 = src1->nb[2];
-
-    const int ne20 = src2->ne[0];
-    const int ne21 = src2->ne[1];
-
-    const cl_ulong nb21 = src2->nb[1];
-
-    const int ne0 = dst->ne[0];
-    const int ne1 = dst->ne[1];
-
-    const int r2 = ne12/ne02;
-    const int r3 = ne13/ne03;
-    const int dst_rows = ne20*ne21; // ne20 = n_used_experts, ne21 = n_rows
-
-    GGML_ASSERT(ne00 == ne10);
-
-    int sgs   = 32; // subgroup size
-    int nsg   = 1;  // number of subgroups
-    int nrows = 1;  // number of row in src1
-    int ndst  = 4;  // number of values produced by each subgroup
-
-    cl_kernel kernel;
-
-    // subgroup mat vec
-    switch (src0->type) {
-        case GGML_TYPE_Q4_0: {
-            kernel = backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat;
-
-            if (backend_ctx->gpu_family == INTEL) {
-                sgs  = 16;
-                nsg  = 1;
-                ndst = 8;
-            } else if (backend_ctx->gpu_family == ADRENO) {
-                sgs  = 64;
-                nsg  = 1;
-                ndst = 8;
-            } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
-            }
-
-            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_0->q));
-            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_0->d));
-            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
-            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra2->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset2));
-            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
-            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
-            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
-            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
-            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb00));
-            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb02));
-            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne10));
-            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne11));
-            CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne12));
-            CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb11));
-            CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb12));
-            CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne20));
-            CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne21));
-            CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb21));
-            CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne0));
-            CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &ne1));
-            CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r2));
-            CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &r3));
-
-            break;
-        }
-        default:
-            GGML_ASSERT(false && "not implemented");;
-    }
-
-    int _ne1 = 1;
-    int ne123 = dst_rows;
-
-    size_t global_work_size[] = {(size_t)(ne01+ndst*nsg-1)/(ndst*nsg)*sgs, (size_t)(_ne1+nrows-1)/nrows*nsg, (size_t)ne123};
-    size_t local_work_size[] = {(size_t)sgs, (size_t)nsg, 1};
-
-#ifdef GGML_OPENCL_PROFILING
-    cl_event evt;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-
-    g_profiling_info.emplace_back();
-    populateProfilingInfo(g_profiling_info.back(), evt, kernel, global_work_size, local_work_size, dst);
-#else
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
-#endif
 }
 
 static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6712,12 +6505,6 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_mul_mat;
-            break;
-        case GGML_OP_MUL_MAT_ID:
-            if (!any_on_device) {
-                return false;
-            }
-            func = ggml_cl_mul_mat_id;
             break;
         case GGML_OP_SCALE:
             if (!any_on_device) {

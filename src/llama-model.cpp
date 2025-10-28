@@ -13926,6 +13926,11 @@ struct llm_build_eagle : public llm_graph_context {
         cb(cur, "result_output", -1);
         res->t_logits = cur;
 
+        //Add ArgSort Node for EAGLE
+        // cur = ggml_top_k(ctx0, cur, 4);
+        // cb(cur, "result_topk", -1);
+        // res->t_topk = cur;
+
         ggml_build_forward_expand(gf, cur);
     }
 };
